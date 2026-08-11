@@ -465,8 +465,11 @@ def _outline_pages(reader: PdfReader) -> set[int]:
     return pages
 
 
-def process_package(path: str) -> list[dict]:
-    package_id = os.path.splitext(os.path.basename(path))[0]
+def process_package(path: str, corpus_root: str) -> list[dict]:
+    # corpus-relative id: job folders routinely contain identically-named PDFs,
+    # and colliding ids would silently merge packages in the analyzer
+    rel = os.path.relpath(path, corpus_root)
+    package_id = os.path.splitext(rel)[0].replace(os.sep, "/")
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     with open(path, "rb") as fh:
@@ -475,7 +478,7 @@ def process_package(path: str) -> list[dict]:
     pkg_record = {
         "record_type": "package",
         "package_id": package_id,
-        "file": os.path.basename(path),
+        "file": rel,
         "file_sha256": file_sha,
         "file_size": os.path.getsize(path),
         "page_count": None,
@@ -597,7 +600,7 @@ def main() -> int:
     done = errors = 0
     with open(args.output, "w", encoding="utf-8") as out:
         if args.workers == 1:
-            results = map(process_package, pdfs)
+            results = (process_package(p, args.corpus_dir) for p in pdfs)
             for records in results:
                 done += 1
                 errors += sum(1 for r in records if r["record_type"] == "package" and r["error"])
@@ -607,16 +610,17 @@ def main() -> int:
                     print(f"  {done}/{len(pdfs)} packages ({errors} errors)", file=sys.stderr)
         else:
             with ProcessPoolExecutor(max_workers=args.workers) as pool:
-                futs = {pool.submit(process_package, p): p for p in pdfs}
+                futs = {pool.submit(process_package, p, args.corpus_dir): p for p in pdfs}
                 for fut in as_completed(futs):
                     done += 1
                     try:
                         records = fut.result()
                     except Exception as exc:
+                        rel = os.path.relpath(futs[fut], args.corpus_dir)
                         records = [{
                             "record_type": "package",
-                            "package_id": os.path.splitext(os.path.basename(futs[fut]))[0],
-                            "file": os.path.basename(futs[fut]),
+                            "package_id": os.path.splitext(rel)[0].replace(os.sep, "/"),
+                            "file": rel,
                             "error": f"worker crash: {type(exc).__name__}: {exc}",
                             "extractor_version": EXTRACTOR_VERSION,
                         }]

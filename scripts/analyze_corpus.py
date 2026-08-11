@@ -26,8 +26,9 @@ import sys
 from collections import Counter, defaultdict
 from statistics import mean, median
 
-NEAR_DUP_JACCARD = 0.6   # page-hash set similarity to call two docs the same
-HUB_HASH_MAX_DOCS = 75   # page hashes in more docs than this are too generic to join on
+NEAR_DUP_JACCARD = 0.6      # page-hash set similarity to call two docs the same
+HUB_HASH_MAX_CLUSTERS = 75  # page hashes spanning more distinct clusters than this
+                            # are too generic to join on (letterheads, blank forms)
 
 
 class UnionFind:
@@ -86,7 +87,11 @@ def cluster_documents(docs: list[dict]) -> dict[int, int]:
 
     seen_pairs: set[tuple[int, int]] = set()
     for h, idxs in hash_to_docs.items():
-        if len(idxs) < 2 or len(idxs) > HUB_HASH_MAX_DOCS:
+        # hub-ness is measured in distinct clusters, not instances: a cutsheet
+        # legitimately reused in 200 packages collapses to a few roots after
+        # the exact premerge and must still be allowed to absorb its
+        # boundary-variant copies
+        if len(idxs) < 2 or len({uf.find(i) for i in idxs}) > HUB_HASH_MAX_CLUSTERS:
             continue
         for a_pos in range(len(idxs)):
             for b_pos in range(a_pos + 1, len(idxs)):
@@ -128,6 +133,13 @@ def main() -> int:
     ok_packages = [p for p in packages if not p.get("error")]
     failed = [p for p in packages if p.get("error")]
     report: dict = {}
+
+    ids = [p["package_id"] for p in packages]
+    if len(set(ids)) != len(ids):
+        dupes = [i for i, c in Counter(ids).items() if c > 1]
+        print(f"WARNING: duplicate package_ids in JSONL ({dupes[:5]}...) — "
+              f"per-package metrics below are corrupted; re-extract with a current "
+              f"extract_corpus.py (ids are corpus-relative paths)", file=sys.stderr)
 
     print("=" * 72)
     print("PHASE 0 — CORPUS ANALYSIS")
@@ -218,8 +230,8 @@ def main() -> int:
     print(f"\n  Top {args.top} most-reused documents:")
     cluster_pkg_counts.sort(key=lambda t: (-t[2], -t[1]))
     for root, n_inst, n_pkgs in cluster_pkg_counts[: args.top]:
-        d0 = text_docs[clusters[root][0]]
-        print(f"    {n_pkgs:3d} pkgs / {n_inst:3d} uses  [{d0['doc_type']:<14}] {_cluster_label(text_docs, clusters[root])}")
+        dt = Counter(text_docs[i]["doc_type"] for i in clusters[root]).most_common(1)[0][0]
+        print(f"    {n_pkgs:3d} pkgs / {n_inst:3d} uses  [{dt:<14}] {_cluster_label(text_docs, clusters[root])}")
 
     report["dedupe"] = {
         "doc_instances_with_text": len(text_docs),
@@ -234,11 +246,16 @@ def main() -> int:
     # ------------------------------------------------------------------ doc types
     print("\n## doc_type distribution")
     inst_types = Counter(d["doc_type"] for d in docs)
-    uniq_types = Counter(text_docs[clusters[root][0]]["doc_type"] for root in clusters)
-    print(f"  {'type':<20}{'instances':>10}{'share':>8}{'unique':>8}")
+    # majority vote per cluster so one misclassified instance can't relabel it;
+    # counted over text-bearing clusters only (no-text docs can't be deduped)
+    uniq_types = Counter(
+        Counter(text_docs[i]["doc_type"] for i in members).most_common(1)[0][0]
+        for members in clusters.values()
+    )
+    print(f"  {'type':<20}{'instances':>10}{'share':>8}{'unique (text)':>14}")
     for t, c in inst_types.most_common():
-        print(f"  {t:<20}{c:>10}{pct(c, len(docs)):>8}{uniq_types.get(t, 0):>8}")
-    report["doc_types"] = {"instances": dict(inst_types), "unique": dict(uniq_types)}
+        print(f"  {t:<20}{c:>10}{pct(c, len(docs)):>8}{uniq_types.get(t, 0):>14}")
+    report["doc_types"] = {"instances": dict(inst_types), "unique_text_clusters": dict(uniq_types)}
 
     # ------------------------------------------------------------------ manufacturers
     print("\n## Manufacturer distribution (top {})".format(args.top))
