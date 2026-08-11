@@ -39,7 +39,9 @@ only if you want the numbers in-repo (it contains no document text).
 Boundary detection and dedupe are heuristic, so their accuracy is measured, not
 assumed. `tests/make_fixture_corpus.py` builds a 31-package synthetic corpus
 (47 unique docs + unique covers, known boundaries, themed CSI sections, a
-simulated scan, a byte-identical duplicate package) and
+simulated scan, a byte-identical duplicate package, and per-package
+Bates + spec-section stamps on a third of the packages — dedupe must see
+through them) and
 `tests/validate_fixture.py` scores extraction against the ground truth:
 
 ```bash

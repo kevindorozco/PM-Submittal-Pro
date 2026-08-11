@@ -176,11 +176,34 @@ CSI_DIVISIONS = {
     "13", "14", "21", "22", "23", "25", "26", "27", "28", "31", "32", "33",
 }
 
-CSI_RE = re.compile(r"(?<![\d.])(\d{2})[ .]?(\d{2})[ .]?(\d{2})(?![\d.])")
+# CSI section: require at least one real separator so bare 6-digit part numbers
+# ("item no. 142010") don't read as sections; glued form only after "section".
+CSI_SEP_RE = re.compile(r"(?<![\d.])(\d{2})[ .](\d{2})[ .]?(\d{2})(?![\d.])")
+CSI_SEP2_RE = re.compile(r"(?<![\d.])(\d{2})(\d{2})[ .](\d{2})(?![\d.])")
+CSI_GLUED_RE = re.compile(r"\bsection\s+(\d{2})(\d{2})(\d{2})(?!\d)", re.I)
 ESR_RE = re.compile(r"\bES[RL]-\d{3,5}\b", re.I)
 PAGE_OF_RE = re.compile(r"\b(?:page|pg\.?|sheet)\s*(\d{1,3})\s*(?:of|/)\s*(\d{1,3})\b", re.I)
 N_OF_M_RE = re.compile(r"(?<![\w/.-])(\d{1,3})\s+of\s+(\d{1,3})(?![\w/.-])", re.I)
-PAGE_STAMP_LINE_RE = re.compile(r"(?:page|pg\.?|sheet)?\s*\d{1,4}\s*(?:(?:of|/)\s*\d{1,4})?", re.I)
+
+# Lines dropped before hashing: per-package assembly artifacts that make the
+# same source document hash differently in every package it appears in.
+# Deliberately NOT dropped: date shapes (07/2024 — revision identity, rule 4),
+# fractions (5/8), 4-digit years, ESR numbers.
+_PAGE_NUM_LINE_RE = re.compile(
+    r"(?:page|pg\.?|sheet)\s*\d{1,4}\s*(?:(?:of|/)\s*\d{1,4})?"  # page 3, page 3 of 4, sheet 2/5
+    r"|\d{1,3}\s*of\s*\d{1,4}"                                    # bare "3 of 4"
+    r"|\d{1,3}",                                                  # bare small page number
+    re.I)
+_BATES_LINE_RE = re.compile(r"[a-z]{0,10}[-#_ ]?\d{5,8}", re.I)   # CASTON-000123, 000123
+_SPEC_STAMP_LINE_RE = re.compile(r"\d{2}[ .]?\d{2}[ .]?\d{2}\s*[-–—]\s*\d{1,4}")  # 09 22 16 - 4
+
+
+def is_stamp_line(line: str) -> bool:
+    return bool(
+        _PAGE_NUM_LINE_RE.fullmatch(line)
+        or _BATES_LINE_RE.fullmatch(line)
+        or _SPEC_STAMP_LINE_RE.fullmatch(line)
+    )
 DOMAIN_RE = re.compile(r"\b(?:www\.)?([a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.(?:com|net|org|us|biz))\b", re.I)
 TOKEN_RE = re.compile(r"[a-z0-9]{2,}")
 
@@ -209,23 +232,26 @@ def _alias_patterns() -> list[tuple[str, re.Pattern]]:
 # ---------------------------------------------------------------------------
 
 def normalize_text(text: str) -> str:
-    """Normalization used for hashing: case/whitespace-insensitive, page-stamp
-    lines dropped (assembly stamps differ between packages for the same source
-    document). Revision dates are kept — they are part of document identity."""
+    """Normalization used for hashing: case/whitespace-insensitive, with
+    per-package assembly artifacts dropped (page numbers, Bates stamps,
+    spec-section stamps) so the same source doc hashes equal across packages.
+    Revision dates are kept — they are part of document identity."""
     t = unicodedata.normalize("NFKC", text).lower()
     kept = []
     for line in t.splitlines():
         line = line.strip()
         if not line:
             continue
-        if PAGE_STAMP_LINE_RE.fullmatch(line):
+        if is_stamp_line(line):
             continue
         kept.append(line)
     return re.sub(r"\s+", " ", " ".join(kept)).strip()
 
 
 def page_features(raw_text: str) -> dict:
-    text = raw_text or ""
+    # pypdf decodes malformed ToUnicode CMaps with surrogatepass; lone
+    # surrogates would crash utf-8 encoding at hash/json time
+    text = (raw_text or "").encode("utf-8", errors="replace").decode("utf-8")
     norm = normalize_text(text)
     has_text = len(norm) >= MIN_PAGE_TEXT_CHARS
     lower = text.lower()
@@ -261,10 +287,10 @@ def page_features(raw_text: str) -> dict:
     markers = {mk for mk in DOC_START_MARKERS if mk in lower}
 
     csi = set()
-    for m2 in CSI_RE.finditer(text):
-        div = m2.group(1)
-        if div in CSI_DIVISIONS:
-            csi.add(f"{m2.group(1)} {m2.group(2)} {m2.group(3)}")
+    for rx in (CSI_SEP_RE, CSI_SEP2_RE, CSI_GLUED_RE):
+        for m2 in rx.finditer(text):
+            if m2.group(1) in CSI_DIVISIONS:
+                csi.add(f"{m2.group(1)} {m2.group(2)} {m2.group(3)}")
 
     return {
         "norm": norm,
@@ -384,7 +410,11 @@ def classify_doc_type(full_lower: str, first_page_lower: str) -> tuple[str, str]
     mention ASTM/product names constantly, so they are checked first."""
     if "safety data sheet" in first_page_lower or "material safety data" in first_page_lower:
         return "sds", "high"
-    if "icc-es" in first_page_lower or re.search(r"\besr-\d", first_page_lower):
+    # cutsheets routinely CITE their ESR number ("complies with ICC-ES ESR-1166")
+    # on page 1 — only an actual evaluation-report heading marks the report itself
+    if "icc-es evaluation report" in first_page_lower or (
+        "evaluation report" in first_page_lower and re.search(r"\besr-\d", first_page_lower)
+    ):
         return "icc_es", "high"
     if "icc-es evaluation report" in full_lower:
         return "icc_es", "medium"
@@ -420,7 +450,7 @@ def guess_title(first_page_lines: list[str], manufacturer: str | None = None) ->
         low = ln.lower()
         if low.strip(" .,®™©") in manu_aliases:  # bare company-name line; the product line follows
             continue
-        if PAGE_STAMP_LINE_RE.fullmatch(ln):
+        if is_stamp_line(low):
             continue
         if DOMAIN_RE.search(low) or low.startswith(("http", "tel", "fax", "phone")):
             continue
@@ -509,6 +539,8 @@ def process_package(path: str, corpus_root: str) -> list[dict]:
     pkg_record["page_count"] = n_pages
     pkg_record["pages_with_text"] = sum(1 for f in feats if f["has_text"])
     pkg_record["has_outline"] = bool(outline_pages)
+    if n_pages == 0:  # structurally valid but empty PDF (corrupt-scan artifact)
+        return [pkg_record]
 
     # Segment: page 0 always starts a document.
     starts: list[tuple[int, int, list[str]]] = [(0, 100, ["package_start"])]

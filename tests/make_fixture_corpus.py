@@ -261,6 +261,29 @@ def render_cover(pkg_idx: int, project: str, theme: str, doc_titles: list[str], 
     c.save()
 
 
+def stamp_package(path: str, pkg_idx: int, section: str):
+    """Simulate assembly-time stamps: Bates number bottom-right, spec-section
+    page stamp bottom-left, on every page. These differ per package, so dedupe
+    must strip them or the same source doc hashes differently everywhere."""
+    reader = PdfReader(path)
+    overlay_path = path + ".stamp.tmp"
+    c = canvas.Canvas(overlay_path, pagesize=letter)
+    for pg in range(1, len(reader.pages) + 1):
+        c.setFont("Helvetica", 8)
+        c.drawString(470, 30, f"CASTON-{pkg_idx:03d}{pg:04d}")
+        c.drawString(54, 30, f"{section} - {pg}")
+        c.showPage()
+    c.save()
+    stamps = PdfReader(overlay_path)
+    writer = PdfWriter()
+    for i, page in enumerate(reader.pages):
+        page.merge_page(stamps.pages[i])
+        writer.add_page(page)
+    with open(path, "wb") as fh:
+        writer.write(fh)
+    os.remove(overlay_path)
+
+
 def main() -> int:
     out_dir = sys.argv[1] if len(sys.argv) > 1 else "fixture"
     corpus_dir = os.path.join(out_dir, "corpus")
@@ -321,7 +344,11 @@ def main() -> int:
         out_path = os.path.join(corpus_dir, f"{pkg_id}.pdf")
         with open(out_path, "wb") as fh:
             writer.write(fh)
-        truth["packages"][pkg_id] = {"theme": theme, "project": project, "docs": gt_docs}
+        stamped = p % 3 == 0
+        if stamped:
+            stamp_package(out_path, p, THEME_SECTION_TITLE[theme][0])
+        truth["packages"][pkg_id] = {"theme": theme, "project": project,
+                                     "stamped": stamped, "docs": gt_docs}
 
     # byte-identical duplicate package (same file submitted twice)
     dup_src = os.path.join(corpus_dir, "PKG-001.pdf")
